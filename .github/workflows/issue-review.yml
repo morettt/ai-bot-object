@@ -1,0 +1,84 @@
+name: Issue Review Bot
+
+on:
+  issues:
+    types: [opened, reopened]
+
+permissions:
+  issues: write
+
+jobs:
+  review-issue:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Review Issue with GPT-4o
+        uses: actions/github-script@v7
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const issue = context.payload.issue;
+            const title = issue.title;
+            const body = issue.body || '（无描述）';
+
+            const systemPrompt = `你是一个 GitHub Issue 质量审核助手。你的职责是评估用户提交的 Issue 质量，并给出建设性的反馈。
+
+请从以下维度评估 Issue：
+1. **标题清晰度**：标题是否简洁、准确地描述了问题？
+2. **描述完整性**：
+   - 如果是 Bug：是否包含复现步骤、期望行为、实际行为、环境信息？
+   - 如果是功能请求：是否描述了使用场景和期望效果？
+   - 如果是问题咨询：是否描述清楚了疑问？
+3. **可操作性**：是否足够具体，让维护者能直接采取行动？
+
+请输出：
+- 质量评分：⭐ 较差 / ⭐⭐ 一般 / ⭐⭐⭐ 良好 / ⭐⭐⭐⭐ 优秀
+- 优点：列出写得好的地方（如有）
+- 改进建议：具体指出缺少什么信息（如有）
+- 语气保持友好、鼓励
+
+如果 Issue 是中文的，请用中文回复；如果是英文的，请用英文回复。`;
+
+            const userPrompt = `请审核以下 GitHub Issue：\n\n**标题**: ${title}\n\n**内容**:\n${body}`;
+
+            let reviewText;
+            try {
+              const response = await fetch('https://api.openai.com/v1/chat/completions', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
+                },
+                body: JSON.stringify({
+                  model: 'gpt-4o',
+                  messages: [
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: userPrompt }
+                  ],
+                  max_tokens: 600,
+                  temperature: 0.7
+                })
+              });
+
+              const data = await response.json();
+
+              if (!response.ok) {
+                console.error('OpenAI API 错误:', JSON.stringify(data));
+                core.setFailed(`OpenAI API 调用失败: ${data.error?.message || '未知错误'}`);
+                return;
+              }
+
+              reviewText = data.choices[0].message.content;
+            } catch (err) {
+              console.error('请求失败:', err);
+              core.setFailed(`请求 OpenAI API 时出错: ${err.message}`);
+              return;
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              body: `## 🤖 AI Issue 质量审核\n\n${reviewText}\n\n---\n*此评论由 AI 机器人自动生成，仅供参考。*`
+            });
