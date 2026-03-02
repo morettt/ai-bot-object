@@ -19,5 +19,12 @@
     "author": "LiightRabbit",
     "repo": "https://github.com/Vince-0906/astrbot_plugin_steam_friend_monitor",
     "tags": []
+  },
+  "astrbot_plugin_char_all": {
+    "display_name": "多功能生活助手",
+    "desc": "记录steam",
+    "author": "LiightRabbit",
+    "repo": "https://github.com/zhongyu0306/MyAstrBot",
+    "tags": []
   }
 }
