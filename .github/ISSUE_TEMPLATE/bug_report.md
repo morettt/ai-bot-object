@@ -1,9 +1,8 @@
 ---
-name: "🐛 Report Bug / 报告 Bug"
-about: "提交 Bug 报告帮助我们改进"
+name: "出现问题了？点这里报告"
+about: "描述你碰到的 Bug，我们来修"
 title: "[Bug] "
 labels: bug
 ---
 
-## 问题描述
-...
+## 发生了什么？
