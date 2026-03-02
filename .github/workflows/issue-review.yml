@@ -93,7 +93,7 @@ jobs:
               // ── 决定要拉取哪些文件 ─────────────────────────────────────
               const CODE_EXTS = ['.js', '.ts', '.mjs', '.cjs', '.py', '.go',
                    '.rs', '.java', '.cpp', '.c', '.cs', '.rb',
-                   '.php', '.sh', '.bash', '.json'];
+                   '.php', '.sh', '.bash', '.json', '.md'];
               const MAX_FILES   = 15;
               const MAX_CHARS   = 60000; // 送给 LLM 的总字符上限
 
