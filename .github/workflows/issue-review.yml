@@ -20,65 +20,270 @@ jobs:
           script: |
             const issue = context.payload.issue;
             const title = issue.title;
-            const body = issue.body || '（无描述）';
+            const body = issue.body || '';
 
-            const systemPrompt = `你是一个 GitHub Issue 质量审核助手。你的职责是评估用户提交的 Issue 质量，并给出建设性的反馈。
+            // ── 尝试从 issue 正文中提取 JSON ──────────────────────────────
+            let pluginJson = null;
+            const jsonMatch = body.match(/\{[\s\S]*?\}/);
+            if (jsonMatch) {
+              try {
+                pluginJson = JSON.parse(jsonMatch[0]);
+              } catch (e) {
+                // 不是合法 JSON，走普通 issue 审核
+              }
+            }
 
-                                  请从以下维度评估 Issue：
-                                  1. **标题清晰度**：标题是否简洁、准确地描述了问题？
-                                  2. **描述完整性**：
-                                     - 如果是 Bug：是否包含复现步骤、期望行为、实际行为、环境信息？
-                                     - 如果是功能请求：是否描述了使用场景和期望效果？
-                                     - 如果是问题咨询：是否描述清楚了疑问？
-                                  3. **可操作性**：是否足够具体，让维护者能直接采取行动？
-                                  
-                                  请输出：
-                                  - 质量评分：⭐ 较差 / ⭐⭐ 一般 / ⭐⭐⭐ 良好 / ⭐⭐⭐⭐ 优秀
-                                  - 优点：列出写得好的地方（如有）
-                                  - 改进建议：具体指出缺少什么信息（如有）
-                                  - 语气保持友好、鼓励
-                                  
-                                  如果 Issue 是中文的，请用中文回复；如果是英文的，请用英文回复。`;
+            // ════════════════════════════════════════════════════════════════
+            //  分支 A：检测到插件 JSON，进行仓库代码审核
+            // ════════════════════════════════════════════════════════════════
+            if (pluginJson && pluginJson.repo) {
+              const repoUrl = pluginJson.repo.trim();
+              const repoMatch = repoUrl.match(/github\.com\/([^\/]+)\/([^\/?#]+)/);
 
-            const userPrompt = `请审核以下 GitHub Issue：\n\n**标题**: ${title}\n\n**内容**:\n${body}`;
-
-            let reviewText;
-            try {
-              const response = await fetch('https://www.dmxapi.cn/v1/chat/completions', {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
-                },
-                body: JSON.stringify({
-                  model: 'gemini-2.0-flash',
-                  messages: [
-                    { role: 'system', content: systemPrompt },
-                    { role: 'user', content: userPrompt }
-                  ],
-                  max_tokens: 600,
-                  temperature: 0.7
-                })
-              });
-
-              const data = await response.json();
-
-              if (!response.ok) {
-                console.error('OpenAI API 错误:', JSON.stringify(data));
-                core.setFailed(`OpenAI API 调用失败: ${data.error?.message || '未知错误'}`);
+              if (!repoMatch) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: [
+                    '## 🤖 AI 插件代码审核',
+                    '',
+                    `❌ 无法解析仓库地址：\`${repoUrl}\``,
+                    '请确保 \`repo\` 字段填写的是有效的 GitHub 仓库链接，例如：',
+                    '`https://github.com/owner/repo`',
+                    '',
+                    '---',
+                    '*此评论由 AI 机器人自动生成，仅供参考。*'
+                  ].join('\n')
+                });
                 return;
               }
 
-              reviewText = data.choices[0].message.content;
-            } catch (err) {
-              console.error('请求失败:', err);
-              core.setFailed(`请求 OpenAI API 时出错: ${err.message}`);
-              return;
-            }
+              const repoOwner = repoMatch[1];
+              const repoName  = repoMatch[2].replace(/\.git$/, '');
 
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: issue.number,
-              body: `## 🤖 AI Issue 质量审核\n\n${reviewText}\n\n---\n*此评论由 AI 机器人自动生成，仅供参考。*`
-            });
+              // ── 获取仓库文件树 ──────────────────────────────────────────
+              let fileTree;
+              try {
+                const treeResp = await github.rest.git.getTree({
+                  owner: repoOwner,
+                  repo:  repoName,
+                  tree_sha: 'HEAD',
+                  recursive: '1'
+                });
+                fileTree = treeResp.data.tree.filter(f => f.type === 'blob');
+              } catch (err) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: [
+                    '## 🤖 AI 插件代码审核',
+                    '',
+                    `❌ 无法访问仓库 \`${repoOwner}/${repoName}\``,
+                    '请确认仓库是**公开（public）**的，且链接填写正确。',
+                    '',
+                    '---',
+                    '*此评论由 AI 机器人自动生成，仅供参考。*'
+                  ].join('\n')
+                });
+                return;
+              }
+
+              // ── 决定要拉取哪些文件 ─────────────────────────────────────
+              const CODE_EXTS   = ['.js', '.ts', '.mjs', '.cjs', '.py', '.go',
+                                   '.rs', '.java', '.cpp', '.c', '.cs', '.rb',
+                                   '.php', '.sh', '.bash'];
+              const MAX_FILES   = 15;
+              const MAX_CHARS   = 60000; // 送给 LLM 的总字符上限
+
+              // 优先纳入 main 字段指定的入口文件
+              const mainFile = pluginJson.main || '';
+              const sortedFiles = fileTree
+                .filter(f => CODE_EXTS.some(ext => f.path.endsWith(ext)))
+                .sort((a, b) => {
+                  if (a.path === mainFile) return -1;
+                  if (b.path === mainFile) return  1;
+                  return 0;
+                })
+                .slice(0, MAX_FILES);
+
+              // ── 逐个拉取文件内容 ───────────────────────────────────────
+              let codeContents = '';
+              for (const file of sortedFiles) {
+                if (codeContents.length >= MAX_CHARS) break;
+                try {
+                  const resp = await github.rest.repos.getContent({
+                    owner: repoOwner,
+                    repo:  repoName,
+                    path:  file.path
+                  });
+                  const raw = Buffer.from(resp.data.content, 'base64').toString('utf-8');
+                  const snippet = raw.slice(0, MAX_CHARS - codeContents.length);
+                  codeContents += `\n\n=== ${file.path} ===\n${snippet}`;
+                } catch (e) {
+                  // 跳过无法读取的文件
+                }
+              }
+
+              if (!codeContents.trim()) {
+                codeContents = '（未找到可读取的代码文件，请检查仓库内容）';
+              }
+
+              // ── 构造 Prompt ────────────────────────────────────────────
+              const systemPrompt = `你是一个专业的插件代码安全审核助手，负责审核提交到插件市场的 GitHub 仓库代码。
+
+请从以下三个维度进行审核：
+
+1. **代码格式与规范**
+   - 命名规范是否统一（驼峰/下划线等）
+   - 代码结构是否清晰，有无明显的代码坏味道
+   - 有无未处理的异常或明显的逻辑错误
+
+2. **安全性检查（重点）**
+   请逐一检查是否存在以下危险行为：
+   - 危险代码执行：eval、Function()、child_process 的不当使用
+   - 网络请求：是否有可疑的数据外传、硬编码的外部接口
+   - 文件系统操作：是否有危险的删除/覆盖操作
+   - 代码混淆：是否存在刻意混淆、隐藏逻辑的代码
+   - 权限滥用：是否超出插件描述所声明的功能范围
+
+3. **功能一致性**
+   - 代码实现与插件描述是否一致
+   - 有无与描述无关的额外功能
+
+输出格式：
+- **总体结论**：✅ 通过 / ⚠️ 需关注 / ❌ 不通过
+- **代码质量**：简短评价
+- **安全风险**：逐条列出发现的问题（无问题则写"未发现明显安全风险"）
+- **改进建议**：具体可操作的建议
+
+语言：插件描述是中文则用中文，否则用英文。语气专业、客观。`;
+
+              const userPrompt = `请审核以下插件仓库的代码：
+
+**插件信息：**
+- 名称：${pluginJson.displayName || pluginJson.name || '未知'}
+- 描述：${pluginJson.description || '（无）'}
+- 作者：${pluginJson.author || '未知'}
+- 语言：${pluginJson.lang || '未知'}
+- 入口文件：${pluginJson.main || '未知'}
+- 仓库：${repoUrl}
+
+**代码内容（共 ${sortedFiles.length} 个文件）：**
+${codeContents}`;
+
+              // ── 调用 LLM ───────────────────────────────────────────────
+              let reviewText;
+              try {
+                const response = await fetch('https://www.dmxapi.cn/v1/chat/completions', {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
+                  },
+                  body: JSON.stringify({
+                    model: 'gemini-2.0-flash',
+                    messages: [
+                      { role: 'system', content: systemPrompt },
+                      { role: 'user',   content: userPrompt }
+                    ],
+                    max_tokens: 1200,
+                    temperature: 0.2
+                  })
+                });
+
+                const data = await response.json();
+                if (!response.ok) {
+                  console.error('API 错误:', JSON.stringify(data));
+                  core.setFailed(`API 调用失败: ${data.error?.message || '未知错误'}`);
+                  return;
+                }
+                reviewText = data.choices[0].message.content;
+              } catch (err) {
+                console.error('请求失败:', err);
+                core.setFailed(`请求 API 时出错: ${err.message}`);
+                return;
+              }
+
+              // ── 发布审核评论 ───────────────────────────────────────────
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                issue_number: issue.number,
+                body: [
+                  '## 🤖 AI 插件代码审核',
+                  '',
+                  `**审核仓库：** [\`${repoOwner}/${repoName}\`](${repoUrl})`,
+                  `**审核文件数：** ${sortedFiles.length} 个`,
+                  '',
+                  reviewText,
+                  '',
+                  '---',
+                  '*此评论由 AI 机器人自动生成，仅供参考。最终审核结论以人工复核为准。*'
+                ].join('\n')
+              });
+
+            // ════════════════════════════════════════════════════════════════
+            //  分支 B：普通 Issue，进行质量审核（原有逻辑）
+            // ════════════════════════════════════════════════════════════════
+            } else {
+              const systemPrompt = `你是一个 GitHub Issue 质量审核助手。你的职责是评估用户提交的 Issue 质量，并给出建设性的反馈。
+
+请从以下维度评估 Issue：
+1. **标题清晰度**：标题是否简洁、准确地描述了问题？
+2. **描述完整性**：
+   - 如果是 Bug：是否包含复现步骤、期望行为、实际行为、环境信息？
+   - 如果是功能请求：是否描述了使用场景和期望效果？
+   - 如果是问题咨询：是否描述清楚了疑问？
+3. **可操作性**：是否足够具体，让维护者能直接采取行动？
+
+请输出：
+- 质量评分：⭐ 较差 / ⭐⭐ 一般 / ⭐⭐⭐ 良好 / ⭐⭐⭐⭐ 优秀
+- 优点：列出写得好的地方（如有）
+- 改进建议：具体指出缺少什么信息（如有）
+- 语气保持友好、鼓励
+
+如果 Issue 是中文的，请用中文回复；如果是英文的，请用英文回复。`;
+
+              const userPrompt = `请审核以下 GitHub Issue：\n\n**标题**: ${title}\n\n**内容**:\n${body}`;
+
+              let reviewText;
+              try {
+                const response = await fetch('https://www.dmxapi.cn/v1/chat/completions', {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
+                  },
+                  body: JSON.stringify({
+                    model: 'gemini-2.0-flash',
+                    messages: [
+                      { role: 'system', content: systemPrompt },
+                      { role: 'user',   content: userPrompt }
+                    ],
+                    max_tokens: 600,
+                    temperature: 0.7
+                  })
+                });
+
+                const data = await response.json();
+                if (!response.ok) {
+                  console.error('OpenAI API 错误:', JSON.stringify(data));
+                  core.setFailed(`OpenAI API 调用失败: ${data.error?.message || '未知错误'}`);
+                  return;
+                }
+                reviewText = data.choices[0].message.content;
+              } catch (err) {
+                console.error('请求失败:', err);
+                core.setFailed(`请求 OpenAI API 时出错: ${err.message}`);
+                return;
+              }
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                issue_number: issue.number,
+                body: `## 🤖 AI Issue 质量审核\n\n${reviewText}\n\n---\n*此评论由 AI 机器人自动生成，仅供参考。*`
+              });
+            }
