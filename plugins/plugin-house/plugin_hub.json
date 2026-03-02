@@ -12,5 +12,12 @@
     "author": "xxuu",
     "repo": "https://github.com/Soffd/astrbot_plugin_yunhuAdapter",
     "tags": []
+  },
+  "test": {
+    "display_name": "gogo",
+    "desc": "记录steam",
+    "author": "LiightRabbit",
+    "repo": "https://github.com/Vince-0906/astrbot_plugin_steam_friend_monitor",
+    "tags": []
   }
 }
